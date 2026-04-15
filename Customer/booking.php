@@ -1,77 +1,164 @@
 <?php
 session_start();
-header('Content-Type: application/json');
-
-if (!isset($_SESSION['user_id'])) {
-  echo json_encode(['success' => false, 'message' => 'You must be logged in to book a motorcycle.']);
-  exit;
-}
-
 require_once "../Database/dbconnect.php";
+
+header("Content-Type: application/json");
+
+/* =================================================
+   Auth check
+================================================= */
+if (!isset($_SESSION['user_id'])) {
+    echo json_encode(["success" => false, "message" => "User not logged in"]);
+    exit;
+}
 
 $user_id = $_SESSION['user_id'];
 
-// --- Get POST data ---
-$motorcycle_id = $_POST['motorcycle_id'] ?? null;
-$start_date = $_POST['start_date'] ?? '';
-$end_date = $_POST['end_date'] ?? '';
+/* =================================================
+   Read POST fields
+================================================= */
+$motorcycle_id = isset($_POST['motorcycle_id']) ? (int)$_POST['motorcycle_id'] : 0;
+$start_date    = trim($_POST['start_date'] ?? '');   // "YYYY-MM-DD HH:MM:00"
+$end_date      = trim($_POST['end_date']   ?? '');   // "YYYY-MM-DD HH:MM:00"
+$full_name     = trim($_POST['full_name']  ?? '');
 
-// --- Validate inputs ---
-if (!$motorcycle_id || !$start_date || !$end_date) {
-  echo json_encode(['success' => false, 'message' => 'All fields are required.']);
-  exit;
+if (!$motorcycle_id || !$start_date || !$end_date || !$full_name) {
+    echo json_encode(["success" => false, "message" => "Missing required fields."]);
+    exit;
 }
 
-// --- Convert datetime-local to MySQL DATETIME ---
-$start_date_db = date('Y-m-d H:i:s', strtotime($start_date));
-$end_date_db   = date('Y-m-d H:i:s', strtotime($end_date));
+/* =================================================
+   Validate datetime format (YYYY-MM-DD HH:MM:SS)
+================================================= */
+$start_ts = strtotime($start_date);
+$end_ts   = strtotime($end_date);
 
-// --- Validate date order ---
-if (strtotime($end_date_db) <= strtotime($start_date_db)) {
-  echo json_encode(['success' => false, 'message' => 'End date cannot be before or equal to start date.']);
-  exit;
+if (!$start_ts || !$end_ts) {
+    echo json_encode(["success" => false, "message" => "Invalid date/time format."]);
+    exit;
 }
 
-// --- Check if motorcycle is available ---
-$stmt = $conn->prepare("
-    SELECT rate_per_hour, status 
-    FROM motorcycles 
-    WHERE motorcycle_id = ? 
-      AND status = 'Available'
-    LIMIT 1
-");
+/* =================================================
+   Rule 1 — End must be after Start
+================================================= */
+if ($end_ts <= $start_ts) {
+    echo json_encode(["success" => false, "message" => "End time must be later than start time."]);
+    exit;
+}
+
+/* =================================================
+   Rule 2 — Minimum rental duration: 1 hour
+================================================= */
+$duration_hours = ($end_ts - $start_ts) / 3600;
+if ($duration_hours < 1) {
+    echo json_encode(["success" => false, "message" => "Minimum rental duration is 1 hour."]);
+    exit;
+}
+
+/* =================================================
+   Rule 3 — Start time must not be in the past
+   (5-minute grace period for network/clock delay)
+================================================= */
+$grace_seconds = 300; // 5 minutes
+if ($start_ts < time() - $grace_seconds) {
+    echo json_encode(["success" => false, "message" => "Start time cannot be in the past."]);
+    exit;
+}
+
+/* =================================================
+   Rule 4 — Bookings cannot be made more than
+   30 days in advance (optional business rule)
+================================================= */
+$max_advance_seconds = 30 * 24 * 3600;
+if ($start_ts > time() + $max_advance_seconds) {
+    echo json_encode(["success" => false, "message" => "Bookings can only be made up to 30 days in advance."]);
+    exit;
+}
+
+/* =================================================
+   Fetch motorcycle details
+================================================= */
+$stmt = $conn->prepare("SELECT rate_per_hour, status FROM motorcycles WHERE motorcycle_id = ? LIMIT 1");
 $stmt->bind_param("i", $motorcycle_id);
 $stmt->execute();
-$res = $stmt->get_result();
-if ($row = $res->fetch_assoc()) {
-  $rate_per_hour = (float)$row['rate_per_hour'];
-} else {
-  echo json_encode(['success' => false, 'message' => 'Motorcycle is not available.']);
-  exit;
+$result = $stmt->get_result();
+
+if ($result->num_rows === 0) {
+    echo json_encode(["success" => false, "message" => "Motorcycle not found."]);
+    exit;
 }
+
+$bike = $result->fetch_assoc();
 $stmt->close();
 
-// --- Calculate total cost ---
-$hours = max(1, ceil((strtotime($end_date_db) - strtotime($start_date_db)) / 3600));
-$total_cost = $hours * $rate_per_hour;
+if (strtolower($bike['status']) !== 'available') {
+    echo json_encode(["success" => false, "message" => "This motorcycle is currently not available."]);
+    exit;
+}
 
-// --- Insert reservation (status = Pending) ---
+/* =================================================
+   Check for overlapping reservations on the
+   same motorcycle (Pending or Approved only)
+================================================= */
+$conflict_sql = "
+    SELECT reservation_id
+    FROM   reservations
+    WHERE  motorcycle_id = ?
+      AND  status IN ('Pending', 'Approved')
+      AND  start_date < ?
+      AND  end_date   > ?
+    LIMIT 1
+";
+$stmt = $conn->prepare($conflict_sql);
+$stmt->bind_param("iss", $motorcycle_id, $end_date, $start_date);
+$stmt->execute();
+$conflict = $stmt->get_result();
+$stmt->close();
+
+if ($conflict->num_rows > 0) {
+    echo json_encode([
+        "success" => false,
+        "message" => "This motorcycle is already booked for part of the selected time slot. Please choose a different time."
+    ]);
+    exit;
+}
+
+/* =================================================
+   Calculate total cost
+   (server-side calculation — do NOT trust the
+    client-sent total_cost value)
+================================================= */
+$total_cost = round($duration_hours * (float)$bike['rate_per_hour'], 2);
+
+/* =================================================
+   Insert reservation
+================================================= */
 $stmt = $conn->prepare("
-    INSERT INTO reservations 
-    (user_id, motorcycle_id, start_date, end_date, total_cost, status, date_created) 
-    VALUES (?, ?, ?, ?, ?, 'Pending', NOW())
+    INSERT INTO reservations
+        (user_id, motorcycle_id, start_date, end_date, total_cost, status)
+    VALUES (?, ?, ?, ?, ?, 'Pending')
 ");
-$stmt->bind_param("iissd", $user_id, $motorcycle_id, $start_date_db, $end_date_db, $total_cost);
+$stmt->bind_param("iissd", $user_id, $motorcycle_id, $start_date, $end_date, $total_cost);
 
 if ($stmt->execute()) {
-  echo json_encode([
-    'success' => true,
-    'message' => 'Booking submitted and is pending admin approval!',
-    'total_cost' => number_format($total_cost, 2)
-  ]);
-} else {
-  echo json_encode(['success' => false, 'message' => 'Database error: ' . $stmt->error]);
-}
+    $reservation_id = $stmt->insert_id;
+    $stmt->close();
 
-$stmt->close();
-$conn->close();
+    echo json_encode([
+        "success"        => true,
+        "message"        => "Reservation successful.",
+        "reservation_id" => $reservation_id,
+        "total_cost"     => $total_cost,
+        "duration_hours" => round($duration_hours, 2)
+    ]);
+} else {
+    $error = $conn->error;
+    $stmt->close();
+
+    echo json_encode([
+        "success" => false,
+        "message" => "Database error. Please try again."
+        // Don't expose $error to the client in production
+    ]);
+}
+?>
